@@ -1,0 +1,5 @@
+#!/bin/bash
+if [[ $1 == purge ]]; then
+    [[ -s /private/var/lib/sysspacefix/moved.list ]] || rm -rf /private/var/lib/sysspacefix
+fi
+exit 0

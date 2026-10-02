@@ -1,0 +1,329 @@
+#!/bin/bash
+# SysSpaceFix: moves heavy, non-critical directories off the system
+# partition into /private/var/stash/SysSpaceFix and leaves directory
+# symlinks behind. dpkg follows directory symlinks, so tweaks installed
+# later land on the data partition as well. "restore" puts it all back.
+#
+# The stash lives outside /private/var/mobile on purpose: the jailbreak's
+# sandbox patch only lets sandboxed apps read paths outside that tree.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+STASH=/private/var/stash/SysSpaceFix
+STATE=/private/var/lib/sysspacefix
+MANIFEST=$STATE/moved.list      # paths we replaced with symlinks, one per line
+EXTRA=$STATE/extra.list         # optional user additions, same format
+LOCKDIR=$STATE/lock
+LOG=$STATE/log.txt
+
+MIN_KB=256              # smaller directories are not worth a symlink
+VAR_RESERVE_KB=51200    # keep at least 50 MB free on the data partition
+ROOT_RESERVE_KB=5120    # keep at least 5 MB free on / after restoring
+
+# Plain data that is only read after boot, when /var is already mounted.
+CANDIDATES=(
+    /Applications
+    /Library/Themes
+    /Library/Wallpaper
+    /Library/Ringtones
+    "/Library/Application Support"
+    /Library/PreferenceBundles
+    /Library/SBSettings
+    /Library/Zeppelin
+    /usr/share
+    /usr/include
+    /usr/local
+)
+
+# Never moved, whatever the candidate lists say: boot, untether, launchd,
+# Substrate and everything the shell and dpkg need to run.
+FORBIDDEN=(
+    /System /bin /sbin /usr/bin /usr/sbin /usr/libexec /usr/lib
+    /etc /private /var /dev /Developer /tmp /cores /mnt /boot /lib
+    /Library/MobileSubstrate /Library/Frameworks
+    /Library/LaunchDaemons /Library/LaunchAgents
+    /Library/Preferences /Library/Caches /Library/Keychains
+    /Library/Logs /Library/Updates /Library/Filesystems
+    /Library/PreferenceLoader
+    /Library/MobileDevice "/Library/Managed Preferences"
+)
+
+# Packages whose files must stay on the system partition. A candidate
+# directory holding any file of theirs is left alone.
+PROTECTED_PKGS=(
+    '*untether*' '*p0sixspwn*' '*evasi0n*' '*absinthe*' '*corona*'
+    '*greenpois0n*' '*redsn0w*' '*jailbreakme*' '*pangu*' '*taig*'
+    'com.ih8sn0w.*' 'com.evad3rs.*' 'com.chronic-dev.*'
+    'mobilesubstrate' 'com.saurik.substrate.*' '*safemode*'
+)
+
+say()  { echo "$*"; [[ -d $STATE ]] && echo "$(date '+%F %T') $*" >>"$LOG"; }
+warn() { say "ВНИМАНИЕ: $*"; }
+
+human() {
+    local kb=$1
+    if (( kb >= 1048576 )); then echo "$((kb / 1048576)).$((kb % 1048576 * 10 / 1048576)) ГБ"
+    elif (( kb >= 1024 )); then echo "$((kb / 1024)) МБ"
+    else echo "$kb КБ"; fi
+}
+
+free_kb() { df -Pk "$1" 2>/dev/null | { read -r _; read -r _ _ _ avail _; echo "${avail:-0}"; }; }
+size_kb() { du -sk "$1" 2>/dev/null | { read -r kb _; echo "${kb:-0}"; }; }
+mount_of() { df -Pk "$1" 2>/dev/null | { read -r _; read -r _ _ _ _ _ mp; echo "$mp"; }; }
+count() { find "$1" 2>/dev/null | wc -l | { read -r n; echo "${n:-0}"; }; }
+
+manifest_list() { [[ -f $MANIFEST ]] && cat "$MANIFEST"; }
+manifest_has() { [[ -f $MANIFEST ]] && grep -qxF -- "$1" "$MANIFEST"; }
+manifest_add() { manifest_has "$1" || echo "$1" >>"$MANIFEST"; }
+manifest_del() {
+    [[ -f $MANIFEST ]] || return 0
+    grep -vxF -- "$1" "$MANIFEST" >"$MANIFEST.new"
+    mv -f "$MANIFEST.new" "$MANIFEST"
+}
+
+ours() { [[ -L $1 && $(readlink "$1") == "$STASH$1" ]]; }
+
+lock() {
+    mkdir -p "$STATE" "$STASH" || exit 1
+    if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        local pid
+        pid=$(cat "$LOCKDIR/pid" 2>/dev/null)
+        if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+            say "SysSpaceFix уже работает (pid $pid)"
+            exit 1
+        fi
+        rm -rf "$LOCKDIR"
+        mkdir "$LOCKDIR" || exit 1
+    fi
+    echo $$ >"$LOCKDIR/pid"
+    trap 'rm -rf "$LOCKDIR"' EXIT
+}
+
+# Prints why a path must not be moved; succeeds if it must not.
+why_unsafe() {
+    local p=$1 f list pkg line
+    [[ $p == /* && $p != */ && $p != *//* && $p != */.* ]] || { echo "некорректный путь"; return 0; }
+    [[ ${p#/} == */* || $p == /Applications ]] || { echo "корень раздела"; return 0; }
+    for f in "${FORBIDDEN[@]}"; do
+        [[ $p == "$f" || $p == "$f"/* || $f == "$p"/* ]] && { echo "системный путь"; return 0; }
+    done
+    [[ $(cd "$p" 2>/dev/null && pwd -P) == "$p" ]] || { echo "путь содержит ссылки"; return 0; }
+    [[ $(mount_of "$p") == / ]] || { echo "не на системном разделе"; return 0; }
+    for list in /private/var/lib/dpkg/info/*.list; do
+        pkg=${list##*/}; pkg=${pkg%.list}
+        for f in "${PROTECTED_PKGS[@]}"; do
+            [[ $pkg == $f ]] || continue
+            while IFS= read -r line; do
+                [[ $line == "$p"/* ]] && { echo "там файлы пакета $pkg"; return 0; }
+            done <"$list"
+        done
+    done
+    return 1
+}
+
+all_candidates() {
+    printf '%s\n' "${CANDIDATES[@]}"
+    [[ -f $EXTRA ]] && grep -v '^[[:space:]]*\(#\|$\)' "$EXTRA"
+}
+
+# Finishes or rolls back a move that was interrupted (crash, power loss).
+recover() {
+    local p dir base sp
+    while IFS= read -r p; do
+        [[ -n $p ]] || continue
+        dir=${p%/*} base=${p##*/} sp=$STASH$p
+        local old="$dir/.$base.ssf-old" lnk="$dir/.$base.ssf-link"
+        local rst="$dir/.$base.ssf-restore" olink="$dir/.$base.ssf-oldlink"
+
+        rm -rf "$sp.ssf-tmp"
+        if [[ -d $old && ! -L $old ]]; then
+            if ours "$p"; then
+                rm -rf "$old"
+            elif [[ ! -e $p && ! -L $p ]]; then
+                say "Восстанавливаю $p после прерванного переноса"
+                mv -T "$old" "$p" && { rm -f "$lnk"; manifest_del "$p"; rm -rf "$sp"; }
+            fi
+        elif [[ -L $lnk && -d $p && ! -L $p ]]; then
+            rm -f "$lnk"; manifest_del "$p"; rm -rf "$sp"
+        fi
+
+        if [[ -L $olink ]]; then
+            # olink only exists once the restored copy was verified
+            [[ ! -e $p && ! -L $p && -d $rst ]] && mv -T "$rst" "$p"
+            if [[ -d $p && ! -L $p ]]; then
+                rm -f "$olink"; manifest_del "$p"; rm -rf "$sp"
+            elif [[ ! -e $p && ! -L $p ]]; then
+                mv -T "$olink" "$p"
+            fi
+        fi
+        [[ -d $rst && ! -L $olink ]] && rm -rf "$rst"
+    done < <(all_candidates; manifest_list)
+}
+
+stash_one() {
+    local p=$1 dir=${1%/*} base=${1##*/} sp=$STASH$1 reason kb vfree
+    local tmp="$STASH$1.ssf-tmp" old="$dir/.$base.ssf-old" lnk="$dir/.$base.ssf-link"
+
+    [[ -d $p && ! -L $p ]] || return 0
+    if reason=$(why_unsafe "$p"); then
+        [[ $QUIET ]] || say "Пропуск $p: $reason"
+        return 0
+    fi
+    kb=$(size_kb "$p")
+    (( kb >= MIN_KB )) || return 0
+    if [[ -e $sp || -L $sp ]]; then
+        warn "$sp уже существует, $p не трогаю"
+        return 1
+    fi
+    vfree=$(free_kb /private/var)
+    if (( vfree < kb + VAR_RESERVE_KB )); then
+        warn "мало места в /var для $p ($(human "$kb"), свободно $(human "$vfree"))"
+        return 1
+    fi
+
+    say "Переношу $p ($(human "$kb"))"
+    mkdir -p "${sp%/*}" || return 1
+    rm -rf "$tmp"
+    if ! cp -a "$p" "$tmp" || [[ $(count "$p") != $(count "$tmp") ]]; then
+        rm -rf "$tmp"
+        warn "не удалось скопировать $p, оставлен на месте"
+        return 1
+    fi
+    mv -T "$tmp" "$sp" || { rm -rf "$tmp"; return 1; }
+    rm -f "$lnk"
+    ln -s "$sp" "$lnk" || { rm -rf "$sp"; return 1; }
+    manifest_add "$p"
+    if ! mv -T "$p" "$old"; then
+        rm -f "$lnk"; manifest_del "$p"; rm -rf "$sp"
+        return 1
+    fi
+    if ! mv -T "$lnk" "$p"; then
+        mv -T "$old" "$p"; rm -f "$lnk"; manifest_del "$p"; rm -rf "$sp"
+        return 1
+    fi
+    rm -rf "$old"
+    MOVED=1
+}
+
+restore_one() {
+    local p=$1 dir=${1%/*} base=${1##*/} sp=$STASH$1 kb rfree
+    local rst="$dir/.$base.ssf-restore" olink="$dir/.$base.ssf-oldlink"
+
+    if ! ours "$p"; then
+        if [[ -d $p && ! -L $p ]]; then
+            manifest_del "$p"
+            [[ -d $sp ]] && warn "$p уже на месте, лишняя копия осталась в $sp"
+            return 0
+        fi
+        warn "$p больше не ссылка SysSpaceFix, пропуск"
+        return 1
+    fi
+    [[ -d $sp ]] || { warn "$sp не найден, $p оставлен как есть"; return 1; }
+
+    kb=$(size_kb "$sp")
+    rfree=$(free_kb /)
+    if (( rfree < kb + ROOT_RESERVE_KB )); then
+        warn "не хватает места для $p: нужно $(human "$kb"), свободно $(human "$rfree")"
+        return 1
+    fi
+
+    say "Возвращаю $p ($(human "$kb"))"
+    rm -rf "$rst"
+    if ! cp -a "$sp" "$rst" || [[ $(count "$sp") != $(count "$rst") ]]; then
+        rm -rf "$rst"
+        warn "не удалось скопировать $sp обратно"
+        return 1
+    fi
+    mv -T "$p" "$olink" || { rm -rf "$rst"; return 1; }
+    if ! mv -T "$rst" "$p"; then
+        mv -T "$olink" "$p"; rm -rf "$rst"
+        return 1
+    fi
+    # olink goes last: while it exists, recover() knows to finish the job
+    rm -rf "$sp"
+    manifest_del "$p"
+    rm -f "$olink"
+}
+
+cmd_stash() {
+    local p rc=0 before
+    lock; recover
+    before=$(free_kb /)
+    while IFS= read -r p; do
+        stash_one "$p" || rc=1
+    done < <(all_candidates)
+    if [[ $MOVED ]]; then
+        say "Системный раздел: было свободно $(human "$before"), стало $(human "$(free_kb /)")"
+    elif [[ ! $QUIET ]]; then
+        echo "Переносить нечего. Свободно на системном разделе: $(human "$before")"
+    fi
+    return $rc
+}
+
+cmd_restore() {
+    local p sp total=0 rfree rc=0
+    lock; recover
+    while IFS= read -r p; do
+        sp=$STASH$p
+        ours "$p" && [[ -d $sp ]] && total=$((total + $(size_kb "$sp")))
+    done < <(manifest_list)
+    rfree=$(free_kb /)
+    if (( rfree < total + ROOT_RESERVE_KB )); then
+        say "Не хватает места на системном разделе, чтобы вернуть всё назад:"
+        say "  нужно $(human $((total + ROOT_RESERVE_KB))), свободно $(human "$rfree")."
+        say "Удалите часть твиков и повторите. Ничего не изменено."
+        return 1
+    fi
+    while IFS= read -r p; do
+        [[ -n $p ]] && { restore_one "$p" || rc=1; }
+    done < <(manifest_list)
+    find "$STASH" -depth -type d -empty -delete 2>/dev/null
+    [[ -s $MANIFEST ]] || rm -f "$MANIFEST"
+    return $rc
+}
+
+cmd_status() {
+    local p reason
+    echo "Системный раздел: свободно $(human "$(free_kb /)")"
+    echo "Раздел данных:    свободно $(human "$(free_kb /private/var)")"
+    echo
+    echo "Перенесено SysSpaceFix:"
+    while IFS= read -r p; do
+        [[ -n $p ]] || continue
+        if ours "$p"; then echo "  $p -> $STASH$p ($(human "$(size_kb "$STASH$p")"))"
+        else echo "  $p (ссылка повреждена или заменена!)"; fi
+    done < <(manifest_list)
+    echo
+    echo "Остальные кандидаты:"
+    while IFS= read -r p; do
+        manifest_has "$p" && continue
+        if [[ -L $p ]]; then echo "  $p: уже ссылка -> $(readlink "$p")"
+        elif [[ ! -d $p ]]; then echo "  $p: нет"
+        elif reason=$(why_unsafe "$p"); then echo "  $p: не переносится ($reason)"
+        else echo "  $p: на месте ($(human "$(size_kb "$p")"))"; fi
+    done < <(all_candidates)
+}
+
+cmd_top() {
+    echo "Крупнейшие каталоги системного раздела:"
+    du -xk --max-depth="${1:-3}" / 2>/dev/null | sort -rn | head -n 30 |
+        while read -r kb p; do printf '%10s  %s\n' "$(human "$kb")" "$p"; done
+}
+
+[[ $(id -u) == 0 ]] || { echo "Нужны права root"; exit 1; }
+
+case $1 in
+    stash)   cmd_stash ;;
+    auto)    QUIET=1 cmd_stash >/dev/null 2>&1; exit 0 ;;
+    restore) cmd_restore ;;
+    status)  cmd_status ;;
+    top)     cmd_top "$2" ;;
+    *)
+        echo "Использование: sysspacefix stash|restore|status|top [глубина]"
+        echo "  stash    перенести тяжёлые каталоги в $STASH"
+        echo "  restore  вернуть всё на системный раздел"
+        echo "  status   что перенесено и сколько места"
+        echo "  top      что занимает системный раздел"
+        echo "Свои каталоги можно добавить в $EXTRA (по одному на строку)."
+        exit 1 ;;
+esac

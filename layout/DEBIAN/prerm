@@ -1,0 +1,17 @@
+#!/bin/bash
+# Removing the package puts every moved directory back first. If that
+# can't be done (not enough room on /), the removal is refused.
+case $1 in
+    remove|purge) ;;
+    *) exit 0 ;;
+esac
+
+if ! /usr/bin/sysspacefix restore; then
+    echo "SysSpaceFix не удалён: не все каталоги удалось вернуть на системный раздел."
+    echo "Освободите место и удалите пакет ещё раз."
+    exit 1
+fi
+if [[ ${CYDIA+@} ]]; then
+    eval "echo 'finish:reboot' >&${CYDIA%% *}"
+fi
+exit 0

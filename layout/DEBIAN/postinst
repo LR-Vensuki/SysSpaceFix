@@ -1,0 +1,14 @@
+#!/bin/bash
+# Stash on install and upgrade; "abort-remove" means our prerm refused to
+# restore (not enough room on /), so leave things as they are.
+case $1 in
+    configure) ;;
+    *) exit 0 ;;
+esac
+
+/usr/bin/sysspacefix stash
+# Moved directories may be held open by running apps: ask Cydia for a reboot.
+if [[ -s /private/var/lib/sysspacefix/moved.list && ${CYDIA+@} ]]; then
+    eval "echo 'finish:reboot' >&${CYDIA%% *}"
+fi
+exit 0

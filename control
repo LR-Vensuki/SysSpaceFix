@@ -1,0 +1,11 @@
+Package: com.legacyreborn.sysspacefix
+Name: SysSpaceFix
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Moves heavy tweak data off the full system partition into /var/stash, leaving symlinks. Substrate, untether and system files stay put. Removing the package moves everything back.
+Maintainer: LegacyReborn
+Author: LegacyReborn
+Section: System
+Depends: firmware (>= 4.0), firmware (<< 8.0), bash, coreutils, findutils, grep
+Conflicts: com.evern.sysspacefix
+Replaces: com.evern.sysspacefix
